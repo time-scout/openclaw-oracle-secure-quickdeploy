@@ -1,0 +1,4 @@
+# Copy this file to 'terraform.tfvars' and provide your Oracle Cloud identifiers.
+compartment_id = "ocid1.tenancy.oc1..."
+vcn_id         = "ocid1.vcn.oc1..."
+subnet_id      = "ocid1.subnet.oc1..."

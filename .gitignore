@@ -1,0 +1,15 @@
+# Credentials and Secrets
+secrets.yml
+.credetntials/
+*.pem
+*.key
+
+# Ansible Logs & Caches
+*.retry
+ansible.log
+
+# Terraform State & Lock Files
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform.lock.hcl

@@ -1,0 +1,314 @@
+---
+- name: Provision Hardened OpenClaw on Ubuntu 24.04
+  hosts: all
+  become: yes
+  vars_files:
+    - ../secrets.yml
+  vars_files:
+    - ../secrets.yml
+  vars:
+    app_dir: "/opt/openclaw"
+    openclaw_version: "2026.4.2"
+
+  tasks:
+    - name: Check if Tailscale is installed
+      command: which tailscale
+      register: tailscale_installed
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Tailscale
+      shell: curl -fsSL https://tailscale.com/install.sh | sh
+      when: tailscale_installed.rc != 0
+
+    - name: Check Tailscale authentication status
+      command: tailscale status
+      register: ts_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Start Tailscale login process in background
+      shell: nohup tailscale up > /tmp/ts_auth.log 2>&1 &
+      when: ts_status.rc != 0 or 'Logged out' in ts_status.stdout
+      changed_when: true
+
+    - name: Wait for Tailscale to generate Auth URL
+      wait_for:
+        path: /tmp/ts_auth.log
+        search_regex: "https://login.tailscale.com/a/"
+        timeout: 15
+      when: ts_status.rc != 0 or 'Logged out' in ts_status.stdout
+      ignore_errors: yes
+
+    - name: Extract Tailscale Auth URL
+      shell: grep -o 'https://login.tailscale.com/a/[a-zA-Z0-9]*' /tmp/ts_auth.log | head -n 1
+      register: ts_url
+      when: ts_status.rc != 0 or 'Logged out' in ts_status.stdout
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Prompt user to authenticate Tailscale
+      pause:
+        prompt: "\n========================================================================\nTAILSCALE AUTHENTICATION REQUIRED!\n\nPlease open this link in your browser to authenticate the server:\n{{ ts_url.stdout | default('Failed to parse URL') }}\n\nAfter you have authenticated, press ENTER to continue deployment.\n========================================================================\n"
+      when: (ts_status.rc != 0 or 'Logged out' in ts_status.stdout) and ts_url.stdout is defined and ts_url.stdout != ""
+
+    - name: Install Docker dependencies
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release]
+        state: present
+        update_cache: yes
+
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Install Fail2Ban
+      apt:
+        name: fail2ban
+        state: present
+
+    - name: Configure Fail2Ban for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [sshd]
+          enabled = true
+          port = 22
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+          findtime = 600
+      notify: Restart Fail2Ban
+
+    - name: Ensure Fail2Ban is started and enabled
+      systemd:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    - name: Add Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: 'a+r'
+
+    - name: Add Docker repository (ARM64)
+      apt_repository:
+        repo: "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable"
+        state: present
+
+    - name: Install Rootless Docker
+      apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin, docker-ce-rootless-extras, uidmap]
+        state: present
+
+    - name: Allow internal traffic between Docker containers
+      iptables:
+        chain: DOCKER-USER
+        in_interface: "br-+"
+        out_interface: "br-+"
+        jump: RETURN
+
+    - name: Setup Anti-SSRF (Block agent access to host local networks for Rootless Docker)
+      iptables:
+        chain: OUTPUT
+        action: insert
+        uid_owner: 2000
+        destination: "{{ item }}"
+        jump: DROP
+      loop:
+        - 169.254.169.254/32
+        - 10.0.0.0/8
+        - 100.64.0.0/10
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+
+    - name: Install iptables-persistent
+      apt:
+        name: iptables-persistent
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Save iptables rules
+      command: netfilter-persistent save
+      changed_when: false
+
+    - name: Create openclaw group
+      group:
+        name: openclaw
+        gid: 2000
+        state: present
+
+    - name: Create user for Rootless Docker
+      user:
+        name: openclaw
+        uid: 2000
+        group: openclaw
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Enable auto-start for Rootless Docker
+      command: loginctl enable-linger openclaw
+
+    - name: Ensure systemd user session is created
+      command: loginctl user-status openclaw
+      ignore_errors: yes
+
+    - name: Initialize Rootless Docker
+      become_user: openclaw
+      command: dockerd-rootless-setuptool.sh install
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/2000"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/2000/bus"
+      args:
+        creates: "/home/openclaw/.docker/run/docker.pid"
+
+    - name: Create working directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: 2000
+        group: 2000
+        mode: '0750'
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/data"
+
+    - name: Set correct subordinate UID permissions for data volume
+      file:
+        path: "{{ app_dir }}/data"
+        state: directory
+        owner: 232071
+        group: 232071
+        mode: '0750'
+      become: yes
+
+    - name: Generate declarative OpenClaw configuration (openclaw.json)
+      copy:
+        dest: "{{ app_dir }}/data/openclaw.json"
+        owner: 232071
+        group: 232071
+        mode: '0600'
+        content: |
+          {
+            "agents": {
+              "defaults": {
+                "model": {
+                  "primary": "kilo/kilo-auto/free"
+                }
+              }
+            },
+            "models": {
+              "mode": "merge",
+              "providers": {
+                "kilo": {
+                  "baseUrl": "https://api.kilo.ai/api/gateway/v1",
+                  "apiKey": "${OPENAI_API_KEY}",
+                  "api": "openai-completions",
+                  "models": [
+                    {
+                      "id": "kilo-auto/free",
+                      "name": "Kilo Auto Free",
+                      "reasoning": false,
+                      "input": ["text"],
+                      "contextWindow": 128000,
+                      "maxTokens": 4096
+                    }
+                  ]
+                }
+              }
+            }
+          }
+
+    - name: Download default Seccomp profile
+      get_url:
+        url: https://raw.githubusercontent.com/moby/profiles/master/seccomp/default.json
+        dest: "{{ app_dir }}/seccomp-openclaw.json"
+        owner: 2000
+        group: 2000
+        mode: '0644'
+
+    - name: Create Hardened docker-compose.yml
+      copy:
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: 2000
+        group: 2000
+        mode: '0600'
+        content: |
+          services:
+            openclaw:
+              image: ghcr.io/openclaw/openclaw:{{ openclaw_version }}
+              read_only: true
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+                - seccomp:./seccomp-openclaw.json
+              ports:
+                - "127.0.0.1:3100:3100"
+              tmpfs:
+                - /tmp:rw,noexec,nosuid,size=64M
+                - /var/tmp:rw,noexec,nosuid,size=32M
+                - /run:rw,noexec,nosuid,size=16M
+              volumes:
+                - ./data:/home/node/.openclaw:rw
+              environment:
+                - OPENCLAW_GATEWAY_BIND=loopback
+                - OPENCLAW_GATEWAY_TOKEN={{ openclaw_gateway_token }}
+                - DOCKER_HOST=tcp://socket-proxy:2375
+                # Telegram
+                - OPENCLAW_TELEGRAM_DM_POLICY=allowlist
+                - OPENCLAW_TELEGRAM_GROUP_POLICY=disabled
+                - OPENCLAW_TELEGRAM_ALLOW_FROM=tg:924805096
+                - TELEGRAM_BOT_TOKEN={{ telegram_bot_token }}
+                # Kilo AI
+                - OPENCLAW_PROVIDER=openai
+                - OPENCLAW_MODEL=kilo-auto/free
+                - OPENAI_BASE_URL=https://api.kilo.ai/api/gateway/v1
+                - OPENAI_API_KEY={{ openai_api_key }}
+              restart: unless-stopped
+              depends_on:
+                - socket-proxy
+            
+            socket-proxy:
+              image: wollomatic/socket-proxy:1
+              user: "0:0"
+              environment:
+                - ALLOW_RESTARTS=1
+                - ALLOW_STOP=1
+                - ALLOW_START=1
+                - ALLOW_CREATE=1
+                - ALLOW_KILL=1
+              volumes:
+                - /run/user/2000/docker.sock:/var/run/docker.sock:ro
+              read_only: true
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+              restart: unless-stopped
+
+    - name: Setup Tailscale Serve (Internal secure access)
+      command: tailscale serve --bg --tcp 3100 tcp://127.0.0.1:3100
+      ignore_errors: yes
+
+    - name: Start OpenClaw container
+      become_user: openclaw
+      environment:
+        DOCKER_HOST: "unix:///run/user/2000/docker.sock"
+      command: docker compose up -d
+      args:
+        chdir: "{{ app_dir }}"
+
+  handlers:
+    - name: Restart Fail2Ban
+      systemd:
+        name: fail2ban
+        state: restarted
