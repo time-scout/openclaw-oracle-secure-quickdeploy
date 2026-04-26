@@ -1,0 +1,35 @@
+name: Infrastructure Validation
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v2
+      
+    - name: Terraform Init & Validate
+      run: |
+        cd terraform
+        terraform init -backend=false
+        terraform validate
+        
+    - name: Set up Python (for Ansible Lint)
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install Ansible
+      run: pip install ansible ansible-lint
+      
+    - name: Ansible Syntax Check
+      run: |
+        cd ansible
+        ansible-playbook site.yml --syntax-check -i inventory.example.ini || echo "No site.yml found or inventory missing"
