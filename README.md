@@ -1,3 +1,5 @@
+![Terraform](https://img.shields.io/badge/terraform-1.0%2B-blueviolet) ![Ansible](https://img.shields.io/badge/ansible-2.9%2B-red) ![Validation](https://github.com/time-scout/openclaw-oracle-secure-quickdeploy/actions/workflows/validation.yml/badge.svg)
+
 # OpenClaw on Oracle Ampere A1: Zero-Trust IaC Template
 
 A fully declarative, production-ready Infrastructure as Code (IaC) template for deploying the **OpenClaw AI Agent** on **Oracle Cloud's Always Free Tier** (Ampere A1 ARM64).
